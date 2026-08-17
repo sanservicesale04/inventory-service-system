@@ -1,0 +1,336 @@
+import { useState, useEffect } from 'react'
+import { Download, Upload, Plus, Search, Trash2 } from 'lucide-react'
+import { supabase } from '../lib/supabaseClient'
+import { useAuth } from '../contexts/AuthContext'
+import { useLanguage } from '../contexts/LanguageContext'
+import { logActivity } from '../lib/activityLog'
+import { exportToExcel, importFromExcel } from '../lib/excelUtils'
+import { confirmDialog, successToast, errorToast } from '../lib/alerts'
+import Modal from '../components/common/Modal'
+import '../styles/crud-pages.css'
+
+const TABS = {
+  'receive': 'สินค้ารับเข้า',
+  'issue': 'สินค้าจ่ายออก',
+  'borrow': 'ยืมสินค้า',
+  'pending_issue': 'สินค้ารอทำจ่าย',
+  'buy_sell': 'สินค้าซื้อมา-ขายไป'
+}
+
+export default function StockTransactions() {
+  const { profile } = useAuth()
+  const { lang } = useLanguage()
+  
+  // Admin-only access
+  if (profile?.role !== 'admin') {
+    return <div style={{ padding: 20, textAlign: 'center' }}>ไม่มีสิทธิ์เข้าถึง</div>
+  }
+
+  const [transactions, setTransactions] = useState([])
+  const [products, setProducts] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [activeTab, setActiveTab] = useState('receive')
+  const [searchQuery, setSearchQuery] = useState('')
+  const [showModal, setShowModal] = useState(false)
+  const [editingId, setEditingId] = useState(null)
+  const [formData, setFormData] = useState({})
+
+  const isLinkedTab = ['receive', 'issue', 'borrow'].includes(activeTab)
+
+  useEffect(() => {
+    loadData()
+    const channel = supabase.channel('stock-changes').on('postgres_changes', { event: '*', schema: 'public', table: 'stock_transactions' }, loadData).subscribe()
+    return () => supabase.removeChannel(channel)
+  }, [])
+
+  async function loadData() {
+    setLoading(true)
+    try {
+      const { data: txData } = await supabase.from('stock_transactions').select('*')
+      const { data: prodData } = await supabase.from('products').select('*')
+      setTransactions(txData || [])
+      setProducts(prodData || [])
+    } catch (err) {
+      errorToast(err.message)
+    }
+    setLoading(false)
+  }
+
+  const tabTransactions = transactions.filter(t => t.transaction_type === activeTab)
+  const filteredTransactions = tabTransactions.filter(t => {
+    const search = searchQuery.toLowerCase()
+    return (t.product_code || '').toLowerCase().includes(search) ||
+           (t.product_name_text || '').toLowerCase().includes(search)
+  })
+
+  function openModal(tx = null) {
+    if (tx) {
+      setEditingId(tx.id)
+      setFormData(tx)
+    } else {
+      setEditingId(null)
+      setFormData(isLinkedTab ? {
+        document_no: '',
+        transaction_date: new Date().toISOString().split('T')[0],
+        product_id: '',
+        quantity: '',
+        notes: '',
+      } : {
+        qt_no: '',
+        transaction_date: new Date().toISOString().split('T')[0],
+        company_name: '',
+        project_name: '',
+        sale: '',
+        product_name_text: '',
+        quantity: '',
+        notes: '',
+      })
+    }
+    setShowModal(true)
+  }
+
+  async function saveTransaction() {
+    if (isLinkedTab) {
+      if (!formData.document_no || !formData.product_id || !formData.quantity) {
+        errorToast('กรุณากรอก เลขที่, สินค้า และจำนวน')
+        return
+      }
+    } else {
+      if (!formData.qt_no || !formData.product_name_text || !formData.quantity) {
+        errorToast('กรุณากรอก เลขที่ QT, สินค้า และจำนวน')
+        return
+      }
+    }
+
+    try {
+      const dataToSave = {
+        ...formData,
+        transaction_type: activeTab,
+      }
+
+      if (editingId) {
+        const { error } = await supabase.from('stock_transactions').update(dataToSave).eq('id', editingId)
+        if (error) throw error
+      } else {
+        const { error } = await supabase.from('stock_transactions').insert([{ ...dataToSave, created_by: profile.id }])
+        if (error) throw error
+      }
+
+      await successToast('บันทึกสำเร็จ')
+      setShowModal(false)
+      loadData()
+    } catch (err) {
+      errorToast(err.message)
+    }
+  }
+
+  async function deleteTransaction(id) {
+    const result = await confirmDialog({ title: 'ลบ?', text: '', icon: 'warning' })
+    if (!result.isConfirmed) return
+    try {
+      const { error } = await supabase.from('stock_transactions').delete().eq('id', id)
+      if (error) throw error
+      await successToast('ลบสำเร็จ')
+      loadData()
+    } catch (err) {
+      errorToast(err.message)
+    }
+  }
+
+  async function handleExport() {
+    const toExport = filteredTransactions.map(t => {
+      if (isLinkedTab) {
+        const prod = products.find(p => p.id === t.product_id)
+        return { 'เลขที่': t.document_no, 'วันที่': t.transaction_date, 'รหัส': prod?.product_code, 'ชื่อ': prod?.product_name, 'จำนวน': t.quantity, 'หมายเหตุ': t.notes }
+      } else {
+        return { 'เลขที่ QT': t.qt_no, 'วันที่': t.transaction_date, 'บริษัท': t.company_name, 'โครงการ': t.project_name, 'Sale': t.sale, 'รหัส': t.product_code, 'ชื่อ': t.product_name_text, 'จำนวน': t.quantity, 'หมายเหตุ': t.notes }
+      }
+    })
+    if (toExport.length === 0) { errorToast('ไม่มีข้อมูล'); return }
+    exportToExcel(toExport, 'stock', `stock_${activeTab}_${new Date().toISOString().split('T')[0]}`)
+    await successToast('ส่งออกสำเร็จ')
+  }
+
+  async function handleImport(event) {
+    const file = event.target.files?.[0]
+    if (!file) return
+    try {
+      const data = await importFromExcel(file)
+      if (data.length === 0) { errorToast('ไฟล์ว่าง'); return }
+      
+      let count = 0
+      for (const row of data) {
+        if (isLinkedTab) {
+          const prodCode = row['รหัส'] || row['product_code'] || ''
+          const prod = products.find(p => p.product_code === prodCode)
+          if (!prod) continue
+          
+          const tx = {
+            document_no: row['เลขที่'] || '',
+            transaction_date: row['วันที่'] || new Date().toISOString().split('T')[0],
+            product_id: prod.id,
+            quantity: row['จำนวน'] || '',
+            notes: row['หมายเหตุ'] || '',
+            transaction_type: activeTab,
+            created_by: profile.id,
+          }
+          const { error } = await supabase.from('stock_transactions').insert([tx])
+          if (!error) count++
+        } else {
+          const tx = {
+            qt_no: row['เลขที่ QT'] || '',
+            transaction_date: row['วันที่'] || new Date().toISOString().split('T')[0],
+            company_name: row['บริษัท'] || '',
+            project_name: row['โครงการ'] || '',
+            sale: row['Sale'] || '',
+            product_code: row['รหัส'] || '',
+            product_name_text: row['ชื่อ'] || '',
+            quantity: row['จำนวน'] || '',
+            notes: row['หมายเหตุ'] || '',
+            transaction_type: activeTab,
+            created_by: profile.id,
+          }
+          const { error } = await supabase.from('stock_transactions').insert([tx])
+          if (!error) count++
+        }
+      }
+      await successToast(`นำเข้า ${count} รายการสำเร็จ`)
+      loadData()
+    } catch (err) {
+      errorToast(err.message)
+    }
+    event.target.value = ''
+  }
+
+  return (
+    <div>
+      <div className="crud-page-header">
+        <div><h1>บันทึกนำเข้า-จ่ายออก</h1><p>{filteredTransactions.length} รายการ</p></div>
+        <div className="crud-page-actions">
+          <button className="btn btn-secondary" onClick={handleExport}><Download size={16} /> Export</button>
+          <label className="btn btn-secondary" style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8 }}>
+            <Upload size={16} /> Import
+            <input type="file" accept=".xlsx,.xls,.csv" onChange={handleImport} style={{ display: 'none' }} />
+          </label>
+        </div>
+      </div>
+
+      <div style={{ display: 'flex', gap: 8, marginBottom: 20, borderBottom: '1px solid var(--color-border)', overflowX: 'auto' }}>
+        {Object.entries(TABS).map(([key, label]) => (
+          <button key={key} onClick={() => { setActiveTab(key); setSearchQuery('') }} style={{ padding: '10px 16px', background: activeTab === key ? 'var(--color-primary)' : 'transparent', color: activeTab === key ? 'white' : 'var(--color-text)', border: 'none', cursor: 'pointer', fontWeight: activeTab === key ? 600 : 400, borderBottom: activeTab === key ? '2px solid var(--color-primary)' : 'none', whiteSpace: 'nowrap' }}>{label}</button>
+        ))}
+      </div>
+
+      <div style={{ marginBottom: 20, display: 'flex', alignItems: 'center', gap: 10, background: 'var(--color-surface)', padding: 12, borderRadius: '8px', border: '1px solid var(--color-border)' }}>
+        <Search size={18} style={{ color: 'var(--color-text-muted)' }} />
+        <input type="text" placeholder="ค้นหา รหัส หรือ ชื่อสินค้า..." value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} style={{ flex: 1, padding: '8px 12px', border: 'none', background: 'transparent', fontSize: '0.9rem', outline: 'none' }} />
+        <button className="btn btn-primary" onClick={() => openModal()}><Plus size={16} /> บันทึกรายการ</button>
+      </div>
+
+      <div className="crud-table-wrapper">
+        <table className="crud-table">
+          <thead>
+            <tr>
+              {isLinkedTab ? (
+                <>
+                  <th>เลขที่</th>
+                  <th>วันที่</th>
+                  <th>รหัสสินค้า</th>
+                  <th>ชื่อสินค้า</th>
+                  <th>จำนวน</th>
+                  <th>หมายเหตุ</th>
+                </>
+              ) : (
+                <>
+                  <th>เลขที่ QT</th>
+                  <th>วันที่</th>
+                  <th>บริษัท</th>
+                  <th>โครงการ</th>
+                  <th>Sale</th>
+                  <th>รหัสสินค้า</th>
+                  <th>ชื่อสินค้า</th>
+                  <th>จำนวน</th>
+                  <th>หมายเหตุ</th>
+                </>
+              )}
+              <th>การกระทำ</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filteredTransactions.map(tx => {
+              const prod = isLinkedTab ? products.find(p => p.id === tx.product_id) : null
+              return (
+                <tr key={tx.id}>
+                  {isLinkedTab ? (
+                    <>
+                      <td className="code">{tx.document_no}</td>
+                      <td>{tx.transaction_date}</td>
+                      <td>{prod?.product_code}</td>
+                      <td>{prod?.product_name}</td>
+                      <td>{tx.quantity}</td>
+                      <td>{tx.notes}</td>
+                    </>
+                  ) : (
+                    <>
+                      <td className="code">{tx.qt_no}</td>
+                      <td>{tx.transaction_date}</td>
+                      <td>{tx.company_name}</td>
+                      <td>{tx.project_name}</td>
+                      <td>{tx.sale}</td>
+                      <td>{tx.product_code}</td>
+                      <td>{tx.product_name_text}</td>
+                      <td>{tx.quantity}</td>
+                      <td>{tx.notes}</td>
+                    </>
+                  )}
+                  <td className="actions">
+                    <button className="btn-icon" onClick={() => openModal(tx)}>✏️</button>
+                    <button className="btn-icon danger" onClick={() => deleteTransaction(tx.id)}><Trash2 size={16} /></button>
+                  </td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+        {filteredTransactions.length === 0 && !loading && <div className="empty-state">ไม่มีข้อมูล</div>}
+      </div>
+
+      <Modal open={showModal} onClose={() => setShowModal(false)} title={editingId ? 'แก้ไข' : 'บันทึกรายการ'} size={isLinkedTab ? 'md' : 'lg'}>
+        {isLinkedTab ? (
+          <>
+            <div className="form-row">
+              <div className="form-group"><label>เลขที่ *</label><input type="text" value={formData.document_no || ''} onChange={(e) => setFormData({ ...formData, document_no: e.target.value })} /></div>
+              <div className="form-group"><label>วันที่ *</label><input type="date" value={formData.transaction_date || ''} onChange={(e) => setFormData({ ...formData, transaction_date: e.target.value })} /></div>
+            </div>
+            <div className="form-group"><label>สินค้า *</label><select value={formData.product_id || ''} onChange={(e) => setFormData({ ...formData, product_id: e.target.value })}><option value="">เลือกสินค้า</option>{products.map(p => (<option key={p.id} value={p.id}>{p.product_code} - {p.product_name}</option>))}</select></div>
+            <div className="form-group"><label>จำนวน *</label><input type="number" value={formData.quantity || ''} onChange={(e) => setFormData({ ...formData, quantity: e.target.value })} /></div>
+            <div className="form-group"><label>หมายเหตุ</label><textarea value={formData.notes || ''} onChange={(e) => setFormData({ ...formData, notes: e.target.value })} rows="2" /></div>
+          </>
+        ) : (
+          <>
+            <div className="form-row">
+              <div className="form-group"><label>เลขที่ QT *</label><input type="text" value={formData.qt_no || ''} onChange={(e) => setFormData({ ...formData, qt_no: e.target.value })} /></div>
+              <div className="form-group"><label>วันที่ *</label><input type="date" value={formData.transaction_date || ''} onChange={(e) => setFormData({ ...formData, transaction_date: e.target.value })} /></div>
+            </div>
+            <div className="form-row">
+              <div className="form-group"><label>บริษัท</label><input type="text" value={formData.company_name || ''} onChange={(e) => setFormData({ ...formData, company_name: e.target.value })} /></div>
+              <div className="form-group"><label>โครงการ</label><input type="text" value={formData.project_name || ''} onChange={(e) => setFormData({ ...formData, project_name: e.target.value })} /></div>
+            </div>
+            <div className="form-row">
+              <div className="form-group"><label>Sale</label><input type="text" value={formData.sale || ''} onChange={(e) => setFormData({ ...formData, sale: e.target.value })} /></div>
+            </div>
+            <div className="form-group"><label>รหัสสินค้า</label><input type="text" value={formData.product_code || ''} onChange={(e) => setFormData({ ...formData, product_code: e.target.value })} /></div>
+            <div className="form-group"><label>ชื่อสินค้า *</label><input type="text" value={formData.product_name_text || ''} onChange={(e) => setFormData({ ...formData, product_name_text: e.target.value })} /></div>
+            <div className="form-group"><label>จำนวน *</label><input type="number" value={formData.quantity || ''} onChange={(e) => setFormData({ ...formData, quantity: e.target.value })} /></div>
+            <div className="form-group"><label>หมายเหตุ</label><textarea value={formData.notes || ''} onChange={(e) => setFormData({ ...formData, notes: e.target.value })} rows="2" /></div>
+          </>
+        )}
+
+        <div style={{ marginTop: 20, display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+          <button className="btn btn-secondary" onClick={() => setShowModal(false)}>ยกเลิก</button>
+          <button className="btn btn-primary" onClick={saveTransaction}>บันทึก</button>
+        </div>
+      </Modal>
+    </div>
+  )
+}
